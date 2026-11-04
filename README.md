@@ -1,5 +1,24 @@
 # CLIProxyAPI Expiring Quota First
 
+> **This is a fork** of [stavarengo/CLIProxyAPI-Expiring-Quota-First](https://github.com/stavarengo/CLIProxyAPI-Expiring-Quota-First).
+> It keeps a session on its account only while that account's prompt cache can still serve it, and
+> moves it to the soonest reset whenever moving costs next to nothing:
+>
+> - **Idle for the cache's lifetime.** `ttl` defaults to 1h, the prompt cache's lifetime for Claude
+>   Code's main conversation, instead of a week. Past it the cache is gone anyway.
+> - **After a compaction.** When a session's requests stay under half the size of its earlier ones
+>   for two requests in a row, its prompt was replaced (a compaction does that), so the cache holds
+>   little it can use. One small request alone may be a side query, so it doesn't count.
+> - **Subagents with a prompt of their own.** A Claude Code fork starts with its parent's whole
+>   conversation and reads it from the parent's cache, so it follows the parent. Any other subagent
+>   starts much smaller and shares nothing, so it goes to the soonest reset from its first request.
+>   The two are told apart by request size, from the client's `Content-Length`.
+> - **Per model.** A prompt cache belongs to one model, so a session is bound once per model: a side
+>   request on a small model neither moves the main conversation nor follows it.
+>
+> A session pushed to another account by a limit (a 5-hour window, say) needs nothing extra: it
+> returns at its next cheap moment like any other. The decision log records each request's size.
+
 [![Release](https://github.com/stavarengo/CLIProxyAPI-Expiring-Quota-First/actions/workflows/ci.yml/badge.svg)](https://github.com/stavarengo/CLIProxyAPI-Expiring-Quota-First/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/stavarengo/CLIProxyAPI-Expiring-Quota-First)](https://github.com/stavarengo/CLIProxyAPI-Expiring-Quota-First/releases/latest)
 [![Built for CLIProxyAPI](https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fstavarengo%2FCLIProxyAPI-Expiring-Quota-First%2Fmain%2Fgo.mod&search=CLIProxyAPI%2Fv8%20(v%5B0-9.%5D%2B)&replace=%241&label=built%20for%20CLIProxyAPI)](https://github.com/router-for-me/CLIProxyAPI)
@@ -57,7 +76,7 @@ flowchart TD
 
 Only the weekly quota counts; the five-hour limits are ignored.
 Among ready accounts the soonest weekly reset wins, except that an account whose reset time is still unknown is tried first, so the plugin learns it.
-A session keeps its account until it has been idle for a week, by default.
+A session keeps its account until it has been idle for an hour, by default, or until moving costs next to nothing (see the note at the top).
 [Configure](docs/configure.md) has the timing and threshold settings, and [Known limits](docs/known-limits.md) what the plugin cannot see.
 
 ## Try it

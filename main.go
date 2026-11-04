@@ -242,8 +242,8 @@ func registration() any {
 		"metadata": pluginapi.Metadata{
 			Name:             "expiring-quota-first",
 			Version:          version,
-			Author:           "stavarengo",
-			GitHubRepository: "https://github.com/stavarengo/CLIProxyAPI-Expiring-Quota-First",
+			Author:           "stavarengo, fork by rodrigohpalmeirim",
+			GitHubRepository: "https://github.com/rodrigohpalmeirim/cpa-expiring-quota-first",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"shadow", "active"}, Description: "shadow only records decisions; active routes."},
 				{Name: "ttl", Type: pluginapi.ConfigFieldTypeString, Description: "Idle time before a session forgets its account (default " + shortDuration(d.TTL) + ")."},

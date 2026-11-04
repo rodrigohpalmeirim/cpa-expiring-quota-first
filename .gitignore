@@ -3,3 +3,4 @@
 *.dll
 *.h
 dist/
+.cache/

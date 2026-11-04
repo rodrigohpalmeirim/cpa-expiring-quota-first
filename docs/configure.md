@@ -13,13 +13,13 @@ plugins:
       enabled: true
       priority: 0       # order among scheduler plugins, CLIProxyAPI's own; not the credential priority
       mode: shadow      # or active
-      ttl: 168h
+      ttl: 1h
       rebind_after: 15m
       min_remaining: 5  # percent of the weekly quota
       state_file: "plugins/expiring-quota-first-data/state.json"  # relative to CLIProxyAPI's working directory, /CLIProxyAPI in the official image
 ```
 
-- `ttl`: how long a session keeps its account after its last request. After that, its next request counts as a new session.
+- `ttl`: how long a session keeps its account after its last request. After that, its next request counts as a new session. The default, 1h, is how long Claude Code's main conversation keeps its prompt cache: past it, staying on the account saves nothing.
 - `rebind_after`: how long a bound account may be missing from the accounts CLIProxyAPI offers before the session moves to another. Until then, each request fails over to the best account for that request only, and the session keeps its binding.
 - `min_remaining`: the percent of the weekly quota under which an account gets no new sessions while another account is ready.
 

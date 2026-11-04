@@ -171,7 +171,7 @@ func TestNoSessionHeaderLeavesItToCLIProxyAPI(t *testing.T) {
 
 func keyOf(req pluginapi.SchedulerPickRequest) string {
 	key, _ := sessionKeys("claude", req)
-	return shortHash(key)
+	return bindingKey(key, req.Model)
 }
 
 func TestSubagentInheritsParentAccount(t *testing.T) {
@@ -190,6 +190,114 @@ func TestSubagentInheritsParentAccount(t *testing.T) {
 	sub.Options.Metadata = map[string]any{"canonical_session_id": "claude:s1:agent:x", "parent_session_id": "claude:s1"}
 	if got := r.pick(sub).AuthID; got != "b" {
 		t.Fatalf("subagent picked %q, want its parent's b", got)
+	}
+}
+
+// sized is a pick request with a body size and a model, as CLIProxyAPI passes the client's headers.
+func sized(req pluginapi.SchedulerPickRequest, model string, size int) pluginapi.SchedulerPickRequest {
+	req.Model = model
+	req.Options.Headers["Content-Length"] = []string{strconv.Itoa(size)}
+	return req
+}
+
+// flipped binds session s1 to b while b resets first, then makes a the soonest reset.
+func flipped(t *testing.T, r *router, now time.Time) {
+	t.Helper()
+	claudeReset(r, "a", now.Add(96*time.Hour))
+	claudeReset(r, "b", now.Add(20*time.Hour))
+	parent := pickReq("s1", "a", "b")
+	parent.Options.Metadata = map[string]any{"canonical_session_id": "claude:s1"}
+	if got := r.pick(sized(parent, "claude-opus", 1_000_000)).AuthID; got != "b" {
+		t.Fatalf("parent picked %q", got)
+	}
+	claudeReset(r, "b", now.Add(168*time.Hour))
+}
+
+func subagent(size int) pluginapi.SchedulerPickRequest {
+	sub := pickReq("s1", "a", "b")
+	sub.Options.Metadata = map[string]any{"canonical_session_id": "claude:s1:agent:x", "parent_session_id": "claude:s1"}
+	return sized(sub, "claude-opus", size)
+}
+
+func TestSubagentWithItsOwnPromptGoesToTheSoonestReset(t *testing.T) {
+	now := time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)
+	r := testRouter(t, &now)
+	flipped(t, r, now)
+	// 40 KB against the parent's 1 MB: a prompt of its own, nothing to read from the parent's cache.
+	if got := r.pick(subagent(40_000)).AuthID; got != "a" {
+		t.Fatalf("subagent picked %q, want the soonest reset a", got)
+	}
+}
+
+func TestForkFollowsItsParent(t *testing.T) {
+	now := time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)
+	r := testRouter(t, &now)
+	flipped(t, r, now)
+	// A fork carries the parent's conversation, so it is as large and reads the parent's cache.
+	if got := r.pick(subagent(1_010_000)).AuthID; got != "b" {
+		t.Fatalf("fork picked %q, want its parent's b", got)
+	}
+}
+
+func TestCompactedSessionMovesOnceItsPromptStaysSmall(t *testing.T) {
+	now := time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)
+	r := testRouter(t, &now)
+	flipped(t, r, now)
+	main := func(size int) string {
+		req := pickReq("s1", "a", "b")
+		req.Options.Metadata = map[string]any{"canonical_session_id": "claude:s1"}
+		return r.pick(sized(req, "claude-opus", size)).AuthID
+	}
+	// Growing within a warm cache: stays.
+	if got := main(1_050_000); got != "b" {
+		t.Fatalf("warm session moved to %q", got)
+	}
+	// One small request (a side query) and back to full size: stays.
+	if got := main(30_000); got != "b" {
+		t.Fatalf("moved on a single small request, to %q", got)
+	}
+	if got := main(1_060_000); got != "b" {
+		t.Fatalf("moved after a side query, to %q", got)
+	}
+	// Compacted: the prompt stays small, so the second small request moves to the soonest reset.
+	if got := main(80_000); got != "b" {
+		t.Fatalf("moved on the first request after compaction, to %q", got)
+	}
+	if got := main(90_000); got != "a" {
+		t.Fatalf("compacted session stayed on %q, want a", got)
+	}
+	if got := main(95_000); got != "a" {
+		t.Fatalf("moved back to %q", got)
+	}
+}
+
+func TestSideRequestOnAnotherModelLeavesTheSessionAlone(t *testing.T) {
+	now := time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)
+	r := testRouter(t, &now)
+	flipped(t, r, now)
+	side := pickReq("s1", "a", "b")
+	side.Options.Metadata = map[string]any{"canonical_session_id": "claude:s1"}
+	// A small request on another model has a cache of its own: it goes to the soonest reset...
+	if got := r.pick(sized(side, "claude-haiku", 5_000)).AuthID; got != "a" {
+		t.Fatalf("side request picked %q", got)
+	}
+	// ...and the main conversation stays where its cache is.
+	main := pickReq("s1", "a", "b")
+	main.Options.Metadata = map[string]any{"canonical_session_id": "claude:s1"}
+	if got := r.pick(sized(main, "claude-opus", 1_100_000)).AuthID; got != "b" {
+		t.Fatalf("main session moved to %q", got)
+	}
+}
+
+func TestBindingFromBeforePerModelKeysCarriesOn(t *testing.T) {
+	now := time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)
+	r := testRouter(t, &now)
+	claudeReset(r, "a", now.Add(20*time.Hour))
+	claudeReset(r, "b", now.Add(96*time.Hour))
+	legacy, _ := sessionKeys("claude", pickReq("s1"))
+	r.st.Bindings[shortHash(legacy)] = &binding{AuthID: "b", LastSeen: now}
+	if got := r.pick(sized(pickReq("s1", "a", "b"), "claude-opus", 500_000)).AuthID; got != "b" {
+		t.Fatalf("legacy binding ignored, picked %q", got)
 	}
 }
 

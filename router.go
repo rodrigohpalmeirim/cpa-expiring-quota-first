@@ -44,13 +44,44 @@ type config struct {
 }
 
 func defaultConfig() config {
-	return config{Mode: "shadow", TTL: 168 * time.Hour, RebindAfter: 15 * time.Minute, MinRemaining: 5, StateFile: "plugins/expiring-quota-first-data/state.json"}
+	return config{Mode: "shadow", TTL: time.Hour, RebindAfter: 15 * time.Minute, MinRemaining: 5, StateFile: "plugins/expiring-quota-first-data/state.json"}
 }
 
 type binding struct {
 	AuthID       string    `json:"auth_id"`
 	LastSeen     time.Time `json:"last_seen"`
 	MissingSince time.Time `json:"missing_since,omitzero"`
+	// Size is the body size of the session's last full-size request, in bytes, which is about what
+	// the account's prompt cache holds for it; 0 while unknown. Shrunk counts the requests in a row
+	// that came in well under it.
+	Size   int64 `json:"size,omitempty"`
+	Shrunk int   `json:"shrunk,omitempty"`
+}
+
+// A request under 1/shrinkFactor of the session's cached size starts a new prompt, as after a
+// compaction: what the account caches for the session is mostly useless to it. One such request
+// may be a side query, so the move waits for shrinkConfirm of them in a row.
+const (
+	shrinkFactor  = 2
+	shrinkConfirm = 2
+)
+
+// track records a request of size bytes and reports whether the session's prompt has been replaced
+// by a much smaller one, so the session can move without losing a warm cache.
+func (b *binding) track(size int64) bool {
+	if size <= 0 {
+		return false
+	}
+	if b.Size > 0 && size*shrinkFactor < b.Size {
+		b.Shrunk++
+		if b.Shrunk >= shrinkConfirm {
+			b.Size, b.Shrunk = size, 0
+			return true
+		}
+		return false
+	}
+	b.Size, b.Shrunk = size, 0
+	return false
 }
 
 // account holds what response headers have said about one credential.
@@ -76,6 +107,7 @@ type decision struct {
 	AuthID  string    `json:"auth_id"`
 	Reason  string    `json:"reason"`
 	Applied bool      `json:"applied"`
+	Size    int64     `json:"size,omitempty"` // request body bytes, when the client sent Content-Length
 }
 
 type state struct {
@@ -211,10 +243,14 @@ func (r *router) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPic
 	if key == "" {
 		return unhandled
 	}
-	key = shortHash(key)
+	// A prompt cache belongs to one model, so a session is bound per model: a side request on a
+	// small model neither moves the main conversation nor follows it.
+	legacyKey := shortHash(key)
+	key = bindingKey(key, req.Model)
 	if parentKey != "" {
-		parentKey = shortHash(parentKey)
+		parentKey = bindingKey(parentKey, req.Model)
 	}
+	size := requestSize(req.Options.Headers)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -226,6 +262,14 @@ func (r *router) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPic
 	fit := func(id string) bool { s, _ := r.standing(id, req.Model, offered[id], now); return s != unusable }
 
 	b := r.st.Bindings[key]
+	if b == nil {
+		// Bindings made before they were kept per model carry on for the session's model.
+		if lb := r.st.Bindings[legacyKey]; lb != nil {
+			copied := *lb
+			b = &copied
+			r.st.Bindings[key] = b
+		}
+	}
 	if b != nil && now.Sub(b.LastSeen) > r.cfg.TTL {
 		b = nil
 	}
@@ -235,7 +279,7 @@ func (r *router) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPic
 		_, why := r.standing(b.AuthID, req.Model, offered[b.AuthID], now)
 		if authID, reason = r.best(req.Candidates, req.Model, now); authID != "" {
 			reason = "bound account " + why + ", rebinding; " + reason
-			r.st.Bindings[key] = &binding{AuthID: authID, LastSeen: now}
+			r.st.Bindings[key] = &binding{AuthID: authID, LastSeen: now, Size: size}
 		} else {
 			reason = "bound account " + why + ", no other account to move to"
 			b.LastSeen = now
@@ -243,6 +287,13 @@ func (r *router) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPic
 	case b != nil && offered[b.AuthID]:
 		authID, reason = b.AuthID, "bound"
 		b.LastSeen, b.MissingSince = now, time.Time{}
+		// After a compaction the cache holds little the session can use, so it may move for free.
+		if b.track(size) {
+			if id, why := r.best(req.Candidates, req.Model, now); id != "" && id != b.AuthID {
+				authID, reason = id, "prompt replaced by a much smaller one, moving; "+why
+				r.st.Bindings[key] = &binding{AuthID: id, LastSeen: now, Size: size}
+			}
+		}
 	case b != nil:
 		if b.MissingSince.IsZero() {
 			b.MissingSince = now
@@ -252,22 +303,30 @@ func (r *router) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPic
 			reason = "bound account unavailable, failing over for this request; " + reason
 		} else {
 			reason = "bound account unavailable too long, rebinding; " + reason
-			r.st.Bindings[key] = &binding{AuthID: authID, LastSeen: now}
+			r.st.Bindings[key] = &binding{AuthID: authID, LastSeen: now, Size: size}
 		}
 	default:
-		if p := r.st.Bindings[parentKey]; parentKey != "" && p != nil && offered[p.AuthID] && fit(p.AuthID) && now.Sub(p.LastSeen) <= r.cfg.TTL {
+		p := r.st.Bindings[parentKey]
+		parentWarm := parentKey != "" && p != nil && offered[p.AuthID] && fit(p.AuthID) && now.Sub(p.LastSeen) <= r.cfg.TTL
+		switch {
+		// A fork starts with its parent's whole conversation and reads it from the parent's cache.
+		// Any other subagent starts with a prompt of its own, far smaller, and shares nothing.
+		case parentWarm && size > 0 && p.Size > 0 && size*shrinkFactor < p.Size:
+			authID, reason = r.best(req.Candidates, req.Model, now)
+			reason = "subagent with a prompt of its own; " + reason
+		case parentWarm:
 			authID, reason = p.AuthID, "subagent, inherits parent's account"
-		} else {
+		default:
 			authID, reason = r.best(req.Candidates, req.Model, now)
 			reason = "new session; " + reason
 		}
 		if authID != "" {
-			r.st.Bindings[key] = &binding{AuthID: authID, LastSeen: now}
+			r.st.Bindings[key] = &binding{AuthID: authID, LastSeen: now, Size: size}
 		}
 	}
 
 	active := r.cfg.Mode == "active" && authID != ""
-	r.record(decision{At: now, Session: key, Model: req.Model, AuthID: authID, Reason: reason, Applied: active})
+	r.record(decision{At: now, Session: key, Model: req.Model, AuthID: authID, Reason: reason, Applied: active, Size: size})
 	if !active {
 		return unhandled
 	}
@@ -542,6 +601,20 @@ func sessionKeys(provider string, req pluginapi.SchedulerPickRequest) (key, pare
 		parentKey = provider + "|" + scope + "|" + parent
 	}
 	return key, parentKey
+}
+
+// bindingKey is the state key of a session's binding for one model, hashed.
+func bindingKey(session, model string) string {
+	return shortHash(session + "|" + strings.ToLower(strings.TrimSpace(model)))
+}
+
+// requestSize is the client request's body size from its Content-Length, or 0 when not sent.
+func requestSize(h map[string][]string) int64 {
+	n, err := strconv.ParseInt(header(h, "Content-Length"), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 func header(h map[string][]string, name string) string {
